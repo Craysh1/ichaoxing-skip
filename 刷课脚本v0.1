@@ -1,0 +1,305 @@
+// ==UserScript==
+// @name         学习通 · 视频学习助手
+// @namespace    local.chaoxing.study
+// @version      0.2.0
+// @description  浮窗、视频队列、静音、暂停续播和任务完成后切换。
+// @match        *://*.chaoxing.com/*
+// @run-at       document-idle
+// @grant        GM_getValue
+// @grant        GM_setValue
+// ==/UserScript==
+
+(() => {
+  'use strict';
+  // 只在学习页面显示窗口，子框架通过父框架统一调度。
+  const isCX = /(^|\.)chaoxing\.com$/.test(location.hostname);
+  const isTop = window === window.top;
+  if (isTop && (!isCX || !/studentstudy|\/knowledge\/cards|\/ananas\/modules\/video/i.test(location.pathname))) return;
+  const CHANNEL = 'cx-study-helper-v1';
+  const defaults = { autoStart: true, muted: true, resume: true, next: true, delay: 3, nextSelector: '' };
+  let settings = { ...defaults, ...GM_getValue('settings', {}) };
+  let running = settings.autoStart;
+  let active = null, records = [], navigation = null, navigationLock = false;
+  const local = new Map(), children = new Map(), logs = [];
+  let serial = 0, childSerial = 0, root, tab = '首页';
+  const boot = Date.now();
+  const send = (target, payload) => target.postMessage({ channel: CHANNEL, ...payload }, '*');
+  const visible = el => !!el && el.isConnected && el.getClientRects().length > 0 && getComputedStyle(el).visibility !== 'hidden';
+  const finished = box => !!box && (box.matches('.ans-job-finished') || !!box.querySelector('.ans-job-finished'));
+  const taskBox = el => el.closest('.ans-attach-ct, .ans-job');
+  const allowedOrigin = origin => { try { return /(^|\.)(chaoxing\.com|edu\.cn)$/.test(new URL(origin).hostname); } catch { return false; } };
+  const log = message => {
+    if (!isTop) { send(parent, { type: 'log', message }); return; }
+    const entry = `${new Date().toLocaleTimeString()}  ${message}`;
+    if (logs.at(-1)?.endsWith(`  ${message}`)) return;
+    logs.push(entry); if (logs.length > 200) logs.shift();
+  };
+  function discover() {
+    for (const v of document.querySelectorAll('video')) {
+      if (local.has(v)) continue;
+      const item = { id: `v${++serial}`, v, controlled: false, pending: false, failed: '', endedAt: 0, timer: null, resumeAttempted: false, resumeTime: 0, attempts: 0 };
+      local.set(v, item);
+      v.addEventListener('pause', () => {
+        if (!item.controlled || !settings.resume || v.ended || v.error || item.timer || item.resumeAttempted) return;
+        item.timer = setTimeout(() => {
+          item.timer = null;
+          if (!item.controlled || !settings.resume || !v.paused || v.ended || v.error) return;
+          item.resumeAttempted = true;
+          item.resumeTime = v.currentTime;
+          play(item);
+        }, 350);
+      });
+      // 只有恢复后真实播放了一段时间，才允许下一次独立暂停触发续播。
+      v.addEventListener('timeupdate', () => {
+        if (!v.paused && v.currentTime - item.resumeTime >= 2) item.resumeAttempted = false;
+      });
+      v.addEventListener('error', () => {
+        clearTimeout(item.timer); item.timer = null;
+        log(`视频错误 ${v.error?.code || 0}；已停止对此视频尝试播放。诊断：${JSON.stringify(diagnostic(item))}`);
+      });
+      v.addEventListener('ended', () => { item.endedAt = Date.now(); });
+    }
+    for (const [v] of local) if (!v.isConnected) local.delete(v);
+  }
+  async function play(item) {
+    const v = item.v;
+    if (!item.controlled || !v.isConnected || !v.paused || v.ended || v.error || item.pending) return;
+    item.pending = true;
+    v.muted = settings.muted;
+    v.playsInline = true;
+    try {
+      item.attempts++;
+      const player = v.closest('.video-js');
+      const button = player && [...player.querySelectorAll('.vjs-play-control, .vjs-big-play-button')].find(b => visible(b) && !b.disabled);
+      // 优先走播放器自己的播放按钮；一次尝试不再追加第二次 play()。
+      if (button) button.click(); else await v.play();
+      item.failed = '';
+    }
+    catch (e) {
+      const message = e.name === 'NotAllowedError' ? '浏览器阻止自动播放，请手动点击一次视频播放按钮' : `播放未成功：${e.name}`;
+      if (item.failed !== message) log(message);
+      item.failed = message;
+    } finally { item.pending = false; }
+  }
+  function diagnostic(item) {
+    const v = item.v;
+    return { code: v.error?.code || 0, readyState: v.readyState, networkState: v.networkState,
+      time: Math.round(v.currentTime || 0), paused: v.paused, ended: v.ended, attempts: item.attempts };
+  }
+  function command(target, enabled, config, gesture = false) {
+    settings = config;
+    for (const item of local.values()) {
+      const wasControlled = item.controlled;
+      item.controlled = enabled && target === item.id;
+      if (item.controlled) {
+        if (item.v.muted !== settings.muted) item.v.muted = settings.muted;
+        if (gesture) item.resumeAttempted = false;
+        if (!wasControlled || gesture) play(item);
+      } else if (wasControlled) {
+        clearTimeout(item.timer); item.timer = null;
+        item.resumeAttempted = false;
+        if (!item.v.paused) item.v.pause();
+      }
+    }
+    for (const child of children.values()) {
+      const prefix = `${child.id}/`;
+      send(child.win, { type: 'command', target: target?.startsWith(prefix) ? target.slice(prefix.length) : null,
+        enabled: enabled && !!target?.startsWith(prefix), config, gesture });
+    }
+  }
+  function snapshot() {
+    const rows = [];
+    for (const item of local.values()) {
+      const v = item.v;
+      if (!visible(v)) continue;
+      const box = taskBox(v);
+      rows.push({ id: item.id, title: v.getAttribute('title') || box?.querySelector('.ans-job-title')?.textContent?.trim() || document.title || '课程视频',
+        done: finished(box), time: Number.isFinite(v.currentTime) ? v.currentTime : 0,
+        duration: Number.isFinite(v.duration) ? v.duration : 0, paused: v.paused, ended: v.ended,
+        error: v.error ? `视频错误 ${v.error.code}${v.error.code === 3 ? '（解码失败）' : ''}，请切换线路或刷新` : item.failed,
+        diagnostic: diagnostic(item),
+        waited: item.endedAt ? Date.now() - item.endedAt : 0 });
+    }
+    const frames = [...document.querySelectorAll('iframe, frame')];
+    for (const [win, child] of children) {
+      const frame = frames.find(f => f.contentWindow === win);
+      if (!frame || Date.now() - child.at > 6000) { children.delete(win); continue; }
+      if (!visible(frame)) continue;
+      const complete = finished(taskBox(frame));
+      for (const row of child.rows) rows.push({ ...row, id: `${child.id}/${row.id}`, done: row.done || (child.rows.length === 1 && complete) });
+    }
+    return rows;
+  }
+  addEventListener('message', event => {
+    const data = event.data;
+    if (!data || data.channel !== CHANNEL || !allowedOrigin(event.origin)) return;
+    if (!isTop && event.source === parent && data.type === 'command') {
+      if (!data.config || typeof data.enabled !== 'boolean') return;
+      command(data.target, data.enabled, { ...defaults, ...data.config }, data.gesture);
+      return;
+    }
+    const frame = [...document.querySelectorAll('iframe, frame')].find(f => f.contentWindow === event.source);
+    if (!frame) return;
+    if (data.type === 'snapshot' && Array.isArray(data.rows)) {
+      let child = children.get(event.source);
+      if (!child) { child = { id: `f${++childSerial}`, win: event.source }; children.set(event.source, child); }
+      child.rows = data.rows.filter(r => r && typeof r.id === 'string' && typeof r.title === 'string').slice(0, 100);
+      child.at = Date.now();
+    } else if (data.type === 'log' && typeof data.message === 'string') log(data.message.slice(0, 300));
+  });
+  function nextButton() {
+    const selector = settings.nextSelector.trim();
+    if (selector) {
+      try { const matches = [...document.querySelectorAll(selector)].filter(visible); return matches.length === 1 ? matches[0] : null; }
+      catch { return null; }
+    }
+    const candidates = [...document.querySelectorAll('a,button,[role="button"],#nextChapter,#prev_next_next')];
+    return candidates.find(el => visible(el) && !el.disabled && el.getAttribute('aria-disabled') !== 'true' && !el.classList.contains('disabled') &&
+      (/^(下一节|下一章节|下一个视频|下一章|下一课)(\s*[>›»])?$/.test(el.textContent.trim()) || ['nextChapter', 'prev_next_next'].includes(el.id)));
+  }
+  function control(gesture = false) {
+    if (!running) { navigation = null; command(null, false, settings); return; }
+    if (navigationLock) { command(null, false, settings); return; }
+    const current = records.find(r => r.id === active);
+    if (current?.done) { log(`任务点已完成：${current.title}`); active = null; }
+    if (!current || current.done) active = records.find(r => !r.done)?.id || null;
+    command(active, !!active, settings, gesture);
+    if (active || !records.length || !records.every(r => r.done) || !settings.next) { navigation = null; return; }
+    // 等待所有嵌套播放器报告并留出任务状态刷新时间。
+    if (Date.now() - boot < 6000) return;
+    const key = records.map(r => r.id).join('|');
+    if (!navigation || navigation.key !== key) navigation = { key, at: Date.now() + settings.delay * 1000 };
+    if (Date.now() < navigation.at) return;
+    const next = nextButton();
+    if (!next) { log('当前视频任务点已完成，未找到唯一可用的下一节入口；请手动选择下一视频，或在设置中指定入口'); return; }
+    navigationLock = true;
+    navigation = null;
+    const previous = key, url = location.href;
+    log('任务点已完成，正在进入下一节');
+    next.click();
+    setTimeout(() => {
+      const changed = location.href !== url || records.map(r => r.id).join('|') !== previous || records.some(r => !r.done);
+      navigationLock = false;
+      if (!changed) { running = false; log('未检测到章节切换，已停止；请手动选择下一节后点击开始'); }
+    }, 8000);
+  }
+  function status(row) { return row.done ? '任务点已完成' : row.error || (row.ended ? (row.waited > 60000 ? '完成状态未更新，请检查任务点' : '播放结束，等待任务点确认') : row.paused ? '等待播放' : '正在播放'); }
+  const time = seconds => `${Math.floor(seconds / 60)}:${String(Math.floor(seconds % 60)).padStart(2, '0')}`;
+  function mount() {
+    const host = document.createElement('div'); host.id = 'cx-study-helper';
+    document.documentElement.append(host); root = host.attachShadow({ mode: 'open' });
+    root.innerHTML = `<style>
+      :host{all:initial;font:14px/1.6 system-ui,"Microsoft YaHei",sans-serif;color:#dce6f4;position:fixed;left:20px;bottom:20px;z-index:2147483647}
+      *{box-sizing:border-box}button,input{font:inherit}button{cursor:pointer;border:1px solid #34435e;border-radius:9px;background:#24324b;color:#e4edff;padding:7px 12px}button:hover{background:#344563}button:focus-visible,input:focus-visible{outline:2px solid #6edbc1}button.primary{background:#62d8ba;color:#102b27;border:0;font-weight:700}
+      .panel{width:min(440px,calc(100vw - 40px));background:#111c30;border:1px solid #34435e;border-radius:18px;box-shadow:0 16px 60px #0006;overflow:hidden}header{padding:17px 20px;display:flex;align-items:center;justify-content:space-between;border-bottom:1px solid #2b3850}header strong{font-size:17px}small,.muted{color:#9dadc7}nav{display:flex;gap:3px;padding:12px 10px;flex-wrap:wrap}nav button{border:0;background:transparent;padding:6px 10px}nav button.on{background:#27413f;color:#7ce7c9}main{padding:0 20px 20px;max-height:min(490px,65vh);overflow:auto}h2{font-size:16px;margin:10px 0}p{margin:9px 0}.card{background:#1c2940;border-radius:12px;padding:15px;margin:10px 0}.actions{display:flex;gap:10px;margin-top:16px}.badge{font-size:12px;color:#7ce7c9}progress{width:100%;height:8px;accent-color:#62d8ba}ul{padding:0;list-style:none}li{padding:10px 0;border-bottom:1px solid #2b3850;overflow-wrap:anywhere}label{display:block;margin:13px 0}input[type=checkbox]{accent-color:#62d8ba;margin-right:10px}input[type=text],input[type=number]{display:block;width:100%;padding:8px;border:1px solid #42516b;border-radius:7px;background:#17243a;color:#fff}pre{white-space:pre-wrap;overflow-wrap:anywhere;font:12px/1.8 system-ui}#icon{border-radius:50%;width:54px;height:54px;background:#62d8ba;color:#102b27;font-size:22px;box-shadow:0 8px 30px #0005}[hidden]{display:none!important}
+    </style><section class="panel"><header><div><strong>学习通 · 学习助手</strong><br><small>视频学习 / v0.1.0</small></div><button id="min" aria-label="最小化">—</button></header><nav></nav><main></main></section><button id="icon" aria-label="展开学习助手" hidden>学</button>`;
+    for (const name of ['首页', '队列', '日志', '答题', '搜题', 'AI', '设置']) {
+      const b = document.createElement('button'); b.textContent = name;
+      b.onclick = () => { tab = name; render(true); }; root.querySelector('nav').append(b);
+    }
+    const panel = root.querySelector('.panel');
+    const extra = document.createElement('style');
+    extra.textContent = `:host{display:block;contain:layout style}.panel{height:min(620px,calc(100dvh - 40px));display:flex;flex-direction:column}header,nav{flex-shrink:0}header{cursor:grab;touch-action:none;user-select:none}header:active{cursor:grabbing}main{flex:1;min-height:0;max-height:none;overflow-y:auto;scrollbar-gutter:stable;overflow-wrap:anywhere}.card{min-height:130px}`;
+    root.append(extra);
+    root.querySelector('header small').textContent = '视频学习 / v0.2.0';
+    let position = GM_getValue('position', null), dragging = null;
+    const place = () => {
+      if (panel.hidden || !position) { host.style.left = '20px'; host.style.top = 'auto'; host.style.bottom = '20px'; return; }
+      position.x = Math.max(0, Math.min(position.x, innerWidth - panel.offsetWidth));
+      position.y = Math.max(0, Math.min(position.y, innerHeight - panel.offsetHeight));
+      host.style.left = `${position.x}px`; host.style.top = `${position.y}px`; host.style.bottom = 'auto';
+    };
+    const header = root.querySelector('header');
+    header.addEventListener('pointerdown', e => {
+      if (e.button !== 0 || e.target.closest('button')) return;
+      const box = host.getBoundingClientRect();
+      dragging = { id:e.pointerId, x:e.clientX-box.left, y:e.clientY-box.top };
+      header.setPointerCapture(e.pointerId); e.preventDefault();
+    });
+    header.addEventListener('pointermove', e => {
+      if (!dragging || dragging.id !== e.pointerId) return;
+      position = { x:e.clientX-dragging.x, y:e.clientY-dragging.y }; place();
+    });
+    const finishDrag = () => { if (dragging && position) GM_setValue('position', position); dragging = null; };
+    header.addEventListener('pointerup', finishDrag);
+    header.addEventListener('pointercancel', finishDrag);
+    header.addEventListener('lostpointercapture', finishDrag);
+    addEventListener('resize', place);
+    const minimize = yes => { panel.hidden = yes; root.querySelector('#icon').hidden = !yes; place(); GM_setValue('minimized', yes); };
+    root.querySelector('#min').onclick = () => minimize(true);
+    root.querySelector('#icon').onclick = () => minimize(false);
+    minimize(GM_getValue('minimized', false)); render(true);
+  }
+  // 在脱离页面的节点上构建视图，再原位更新；保留按钮、滚动容器和焦点。
+  function reconcile(target, source) {
+    for (let i = 0; i < source.childNodes.length; i++) {
+      const next = source.childNodes[i], old = target.childNodes[i];
+      if (!old) { target.append(next.cloneNode(true)); continue; }
+      if (old.nodeType !== next.nodeType || old.nodeName !== next.nodeName) { target.replaceChild(next.cloneNode(true), old); continue; }
+      if (next.nodeType === Node.TEXT_NODE) { if (old.data !== next.data) old.data = next.data; continue; }
+      for (const attr of [...old.attributes]) if (!next.hasAttribute(attr.name)) old.removeAttribute(attr.name);
+      for (const attr of next.attributes) if (old.getAttribute(attr.name) !== attr.value) old.setAttribute(attr.name, attr.value);
+      reconcile(old, next);
+    }
+    while (target.childNodes.length > source.childNodes.length) target.lastChild.remove();
+    // cloneNode 不复制事件处理器，按树位置补回。
+    const attach = (a,b) => { a.onclick=b.onclick; a.onchange=b.onchange; [...b.children].forEach((c,i)=>attach(a.children[i],c)); };
+    attach(target, source);
+  }
+  function render(force = false) {
+    if (!root) return;
+    for (const b of root.querySelectorAll('nav button')) b.classList.toggle('on', b.textContent === tab);
+    if (!force && ['设置', '答题', '搜题', 'AI'].includes(tab)) return;
+    const live = root.querySelector('main'), main = document.createElement('main');
+    const add = (tag, value, parent = main, cls = '') => { const el = document.createElement(tag); el.textContent = value; el.className = cls; parent.append(el); return el; };
+    if (tab === '首页') {
+      add('h2', running ? '● 自动学习已开启' : '○ 已停止');
+      const row = records.find(r => r.id === active) || records.find(r => !r.done) || records[0];
+      const card = add('div', '', main, 'card');
+      add('div', row?.title || '等待识别课程视频', card);
+      add('p', row ? status(row) : '进入课程的视频学习页面后自动识别。', card, 'badge');
+      const p = document.createElement('progress'); p.max = row?.duration || 1; p.value = row?.time || 0; card.append(p);
+      add('small', `${time(row?.time || 0)} / ${time(row?.duration || 0)}`, card);
+      add('p', `已识别 ${records.length} 个视频 · 完成 ${records.filter(r => r.done).length} 个任务点`, main, 'muted');
+      add('p', '续播开启时，手动暂停也会恢复。需要停止时，请使用下面的停止按钮。', main, 'muted');
+      const actions = add('div', '', main, 'actions');
+      add('button', '开始', actions, 'primary').onclick = () => { running = true; navigationLock = false; navigation = null; log('开始自动学习'); control(true); render(); };
+      add('button', '停止', actions).onclick = () => { running = false; navigation = null; command(null, false, settings); log('已停止自动学习'); render(); };
+    } else if (tab === '队列') {
+      add('h2', '当前页面的视频');
+      add('p', '按已识别的播放器顺序依次播放；后续章节在打开后加入队列。', main, 'muted');
+      if (!records.length) add('p', '暂未识别到视频。');
+      const ul = add('ul', '');
+      records.forEach((r, i) => { const li = add('li', `${i + 1}. ${r.title}`, ul); add('div', `${status(r)} · ${time(r.time)} / ${time(r.duration)}`, li, 'muted'); });
+    } else if (tab === '日志') {
+      add('h2', '运行日志'); add('pre', logs.join('\n') || '暂无日志');
+      add('button', '导出诊断').onclick = () => {
+        const blob = new Blob([JSON.stringify({ version:'0.2.0', browser:navigator.userAgent, videos:records.map(r=>({id:r.id, ...r.diagnostic})), logs }, null, 2)], {type:'application/json'});
+        const url = URL.createObjectURL(blob), a = document.createElement('a');
+        a.href = url; a.download = '学习助手诊断.json'; a.click(); setTimeout(()=>URL.revokeObjectURL(url), 1000);
+      };
+      add('button', '清空日志').onclick = () => { logs.length = 0; render(); };
+    } else if (tab === '设置') {
+      add('h2', '视频设置');
+      const save = () => { GM_setValue('settings', settings); navigation = null; command(active, running && !!active, settings); };
+      for (const [key, title] of [['autoStart','打开学习页面自动开始'],['muted','静音播放'],['resume','暂停后自动续播'],['next','任务点完成后自动进入下一节']]) {
+        const label = add('label', ''); const input = document.createElement('input'); input.type = 'checkbox'; input.checked = settings[key]; label.append(input, title);
+        input.onchange = () => { settings[key] = input.checked; save(); };
+      }
+      const delay = add('label', '切换前等待（秒，最少 3 秒）'); const number = document.createElement('input'); number.type = 'number'; number.min = '3'; number.max = '60'; number.value = settings.delay; delay.append(number);
+      number.onchange = () => { settings.delay = Math.max(3, Math.min(60, Number(number.value) || 3)); number.value = settings.delay; save(); };
+      const label = add('label', '下一节按钮选择器（可选，适配特殊页面）'); const input = document.createElement('input'); input.type = 'text'; input.placeholder = '例如：#nextChapter'; input.value = settings.nextSelector; label.append(input);
+      input.onchange = () => { try { if (input.value.trim()) document.querySelector(input.value.trim()); settings.nextSelector = input.value.trim(); save(); input.setCustomValidity(''); } catch { input.setCustomValidity('选择器格式不正确'); input.reportValidity(); } };
+    } else { add('h2', tab); add('p', '此板块已预留，当前版本尚未接入功能。', main, 'muted'); }
+    if (force) live.replaceChildren(...main.childNodes);
+    else reconcile(live, main);
+  }
+  discover();
+  if (isTop) { mount(); log('助手已加载；等待视频及任务点状态'); }
+  setInterval(() => {
+    discover();
+    const rows = snapshot();
+    if (!isTop) send(parent, { type: 'snapshot', rows });
+    else { records = rows; control(); render(); }
+  }, 1000);
+})();
