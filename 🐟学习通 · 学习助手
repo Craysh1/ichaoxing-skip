@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         学习通 · 视频学习助手
 // @namespace    local.chaoxing.study
-// @version      1.0.0
+// @version      1.0.5
 // @description  浮窗、视频队列、静音、暂停续播和任务完成后切换。
 // @match        *://*.chaoxing.com/*
 // @match        https://chatgpt.com/*
@@ -21,7 +21,7 @@
 
 (() => {
   'use strict';
-  const VERSION = '1.0.0';
+  const VERSION = '1.0.5';
   const CHANNEL_NAME = '学习通刷课搜题';
   const providers = { chatgpt: 'https://chatgpt.com/', deepseek: 'https://chat.deepseek.com/' };
   const isChat = ['chatgpt.com', 'chat.deepseek.com'].includes(location.hostname);
@@ -32,7 +32,7 @@
   if (isTop && (!isCX || !/studentstudy|studentcourse|stucoursemiddle|\/knowledge\/cards|\/ananas\/modules\/video|^\/base\b|\/visit\/courses|\/space\/index|\/work(?:\/|$)|\/exam(?:\/|$)/i.test(location.pathname))) return;
   const CHANNEL = 'cx-study-helper-v1';
   const instanceId = crypto.randomUUID();
-  const defaults = { autoStart: true, muted: true, resume: true, next: true, delay: 3, nextSelector: '', autoAnswer: false, autoSubmit: false, selectionSearch: false, provider: 'chatgpt', quizSelector: '', optionSelector: '', submitSelector: '' };
+  const defaults = { autoStart: true, muted: true, resume: true, next: true, catalogFromTop: true, delay: 3, nextSelector: '', autoAnswer: false, autoSubmit: false, selectionSearch: false, provider: 'deepseek', quizSelector: '', optionSelector: '', submitSelector: '' };
   let settings = { ...defaults, ...GM_getValue('settings', {}) };
   settings = {selfAnswer:false, answerDelay:3, multiDelay:0.3, practiceSubmit:false, ...settings};
   let running = settings.autoStart;
@@ -209,7 +209,10 @@
         if (/判断题|单选题|多选题/.test(box.innerText || '') && queryAll(box, 'button,input[type="submit"],a,[role="button"]').some(b => /^(提交|确定|提交答案)$/.test((b.innerText || b.value || '').trim()))) { known.push(box); break; }
       }
     }
-    return [...new Set(known)].filter(visible);
+    return [...new Set(known)].filter(box=>visible(box)&&
+      !box.matches('.vjs-error-display,.vjs-error-dialog')&&
+      (box.matches('.ans-videoquiz-container,.ans-videoquiz,.videoquiz,.vjs-quiz,.quiz-container')||!!settings.quizSelector||
+       !!box.querySelector('.tkItem_title,.ans-videoquiz-title,.question-title,.quiz-title,[data-question]')||/判断题|单选题|多选题/.test(box.innerText||'')));
   }
   function hasQuiz() { return quizBoxes().some(box => /判断题|单选题|多选题|提交答案/.test(box.innerText || '') || !!settings.quizSelector); }
   function scanQuestions() {
@@ -321,6 +324,14 @@
     try{
       const sourceImages=queryAll(box,'img').filter(visible),images=[];
       for(const img of sourceImages){
+        // 优先保存浏览器已经成功解码的像素，避免重新下载得到错误响应或错误 MIME。
+        if(img.complete&&img.naturalWidth>0&&img.naturalHeight>0){
+          try{
+            const raster=document.createElement('canvas');raster.width=img.naturalWidth;raster.height=img.naturalHeight;
+            raster.getContext('2d').drawImage(img,0,0);
+            images.push(raster.toDataURL('image/png'));continue;
+          }catch{/* 跨域画布无法读取时使用原有资源读取路径。 */}
+        }
         const response=await fetch(img.currentSrc||img.src,{signal:AbortSignal.timeout(12000)});
         if(!response.ok)throw Error('原题图片无法读取');
         const blob=await response.blob();if(blob.size>8*1024*1024)throw Error('原题图片过大');
@@ -360,11 +371,12 @@
     try{
       scanQuestions();const q=localQuestions.find(q=>q.id===data.target&&q.signature===data.signature&&q.kind==='practice');
       if(!q||q.filled)throw Error('题目已变化或已有答案，未发送');
-      if(data.capture){
+      const capture=async()=>{
         const image=await captureRegion(q.box.closest('.singleQuesId')||q.box);
-        practiceReply({type:'practice-ready',token:data.token,images:[image]});return;
-      }
-      if(q.media.length>3)throw Error('本题超过 3 张图片，请手动分组搜题');
+        practiceReply({type:'practice-ready',token:data.token,images:[image],regionCapture:true});
+      };
+      if(data.capture||q.media.length>3){await capture();return;}
+      try{
       const images=[];
       for(const el of q.media){
         let blob;
@@ -381,7 +393,10 @@
         images.push({name:`question-${images.length+1}.${blob.type.split('/')[1]}`,type:blob.type,size:blob.size,dataURL});
       }
       practiceReply({type:'practice-ready',token:data.token,images});
-    }catch(error){practiceReply({type:'practice-ready',token:data.token,error:`无法准备题目：${error.message}。跨域图片可截图后手动搜题。`});}
+      }catch(mediaError){
+        try{await capture();}catch(captureError){throw Error(`原题图片读取失败（${mediaError.message}）；整题截图也失败（${captureError.message}）`);}
+      }
+    }catch(error){practiceReply({type:'practice-ready',token:data.token,error:`无法准备题目：${error.message}`});}
   }
   function receivePractice(data){
     if(data.type==='practice-ready'&&preparingPractice?.token===data.token){
@@ -389,6 +404,7 @@
       if(!settings.selfAnswer||!running)return;
       if(data.error){setPractice(q.id,'error',data.error);return;}
       if(!questions.some(x=>x.id===q.id&&x.signature===q.signature)){setPractice(q.id,'error','题目已变化');return;}
+      if(data.regionCapture){q.captureAttempt=true;q.textOverride='附件是本题完整截图，包含题干、公式和全部选项。请以截图为准，注意公式的上下标、正负号和分数；按选项字母回答，填空按顺序填写。看不清时留空，不要猜测或沿用上一题的答案。';}
       setPractice(q.id,'searching','等待 AI 回答');startSearch(q,data.images||[]);
     }
     if(data.type==='practice-applied'&&pendingFill?.id===data.token){
@@ -425,6 +441,7 @@
   }
   function tickPractice(){
     if(!settings.selfAnswer||!running)return;
+    if(records.some(r=>!r.done))return;
     if(preparingPractice){if(Date.now()-preparingPractice.at>45000){setPractice(preparingPractice.question.id,'error','准备题目超时');preparingPractice=null;}return;}
     if(pendingFill){
       // AI 在前台时子框架心跳可能过期；由实际题目框架核对签名，不以过期快照取消答案。
@@ -604,11 +621,12 @@
     }catch{log('图片读取失败','error');}finally{imageLoading=false;if(tab==='搜题')render(true);}
   }
   function command(target, enabled, config, gesture = false) {
-    if(isTop) config={...config,sessionRunning:running,operationEpoch};
+    if(isTop) config={...config,sessionRunning:running,operationEpoch,submitConfirmUntil};
     else if(Number.isInteger(config.operationEpoch)){
       if(operationEpoch!==config.operationEpoch)submitConfirmUntil=0;
       operationEpoch=config.operationEpoch;
     }
+    if(!isTop&&Number.isFinite(config.submitConfirmUntil))submitConfirmUntil=Math.max(submitConfirmUntil,Math.min(config.submitConfirmUntil,Date.now()+60000));
     settings = config;
     for (const item of local.values()) {
       const wasControlled = item.controlled;
@@ -669,6 +687,8 @@
     if(data.type==='practice-submitted'){
       submitConfirmUntil=Date.now()+60000;
       if(!isTop)send(parent,{type:'practice-submitted'});
+      // 确认窗可能在同级框架；仅转发本次提交产生的短时确认授权。
+      command(active,isTop?running&&!!active:settings.sessionRunning===true&&!!active,{...settings,submitConfirmUntil});
       return;
     }
     if(data.type==='selection-captured'){if(isTop)receiveSelectionCapture(data);else send(parent,data);return;}
@@ -699,13 +719,15 @@
       (/^(下一节|下一章节|下一个视频|下一章|下一课|next|next\s+(?:chapter|lesson|video))\s*[>›»]?$/i.test(el.textContent.trim()) || ['nextChapter', 'prev_next_next'].includes(el.id)));
   }
   const submittedPractice=new Set();
-  const confirmedDialogs=new WeakSet();
+  const confirmedDialogs=new WeakMap();
   function confirmKnownSubmit(){
     const dialogs=queryAll(document,'.popDiv').filter(el=>visible(el)&&/^\s*(?:Submit\s*[?？]|确认提交[?？]?|确定提交[?？]?)\s*$/i.test(el.querySelector('#popcontent')?.textContent||''));
     if(dialogs.length!==1)return false;
     const dialog=dialogs[0],button=dialog.querySelector('#popok');
-    if(!button||!visible(button)||button.getAttribute('aria-disabled')==='true'||confirmedDialogs.has(dialog))return false;
-    confirmedDialogs.add(dialog);button.click();log('已点击提交确认，等待平台完成标记');return true;
+    if(!button||!visible(button)||button.getAttribute('aria-disabled')==='true')return false;
+    const attempt=confirmedDialogs.get(dialog);
+    if(attempt&&(attempt.count>=3||Date.now()-attempt.at<3000))return false;
+    confirmedDialogs.set(dialog,{at:Date.now(),count:(attempt?.count||0)+1});button.click();log('已点击提交确认，等待平台完成标记');return true;
   }
   function submitPractice(){
     if(!settings.selfAnswer||!settings.practiceSubmit||settings.sessionRunning===false)return;
@@ -716,11 +738,14 @@
     if(!qs.length||qs.some(q=>q.blanks.length?!q.blanks.every(el=>blankValue(el)):!q.options.some(optionSelected)))return;
     if(confirmKnownSubmit())return;
     const key=qs.map(q=>q.signature).join('|');if(submittedPractice.has(key))return;
-    const buttons=[...document.querySelectorAll('button,a,input[type="submit"],[role="button"]')].filter(el=>visible(el)&&!el.disabled&&el.getAttribute('aria-disabled')!=='true'&&/^(提交|提交答案|提交作业|交卷|Submit)$/i.test((el.value||el.textContent).trim()));
+    const available=el=>visible(el)&&!el.disabled&&el.getAttribute('aria-disabled')!=='true';
+    // 作业页优先使用明确的提交控件，避免其他同名入口令通用匹配产生歧义。
+    const workButtons=queryAll(document,'#submitFocus a.completeBtn[onclick]').filter(el=>available(el)&&/^\s*submitValidate\s*\(\s*\)\s*;?\s*$/.test(el.getAttribute('onclick')));
+    const buttons=workButtons.length?workButtons:[...document.querySelectorAll('button,a,input[type="submit"],[role="button"]')].filter(el=>available(el)&&/^(提交|提交答案|提交作业|交卷|Submit)$/i.test((el.value||el.textContent).trim()));
     if(buttons.length!==1)return;
     submittedPractice.add(key);submitConfirmUntil=Date.now()+60000;
     if(!isTop)send(parent,{type:'practice-submitted'});
-    buttons[0].click();log('已点击整份测验提交，等待提交确认');
+    buttons[0].click();log('已点击整份测验 / 作业提交，等待提交确认');
     let attempts=0;
     const epoch=operationEpoch;
     const confirmation=setInterval(()=>{
@@ -734,6 +759,7 @@
     },500);
   }
   function maybeSubmitPractice(){
+    if(records.some(r=>!r.done))return;
     if(!running||!settings.selfAnswer||!settings.practiceSubmit||pendingRequest||pendingFill||preparingPractice)return;
     const qs=questions.filter(q=>q.kind==='practice');
     // 只提交所有题目均收到填入成功回执的页面，不将部分已有答案视为完整作答。
@@ -781,11 +807,11 @@
     if(catalog.length){
       const current=catalog.filter(el=>el.classList.contains('posCatalog_active'));
       if(current.length!==1)return null;
-      for(const row of catalog.slice(catalog.indexOf(current[0])+1)){
+      for(const row of (settings.catalogFromTop?catalog.filter(row=>row!==current[0]):catalog.slice(catalog.indexOf(current[0])+1))){
         if(catalogState(row)==='done')continue;
         return row.querySelector('.posCatalog_name[onclick]');
       }
-      const earlier=catalog.slice(0,catalog.indexOf(current[0])).find(row=>catalogState(row)==='pending');
+      const earlier=settings.catalogFromTop&&catalog.slice(0,catalog.indexOf(current[0])).find(row=>catalogState(row)==='pending');
       if(earlier)return earlier.querySelector('.posCatalog_name[onclick]');
       return null;
     }
@@ -793,7 +819,7 @@
     const rows=all.filter(el=>visible(el)&&!all.some(other=>other!==el&&el.contains(other)));
     const current=rows.filter(el=>el.matches('[aria-current="page"],[aria-current="true"],.current,.active,.curr')||el.querySelector('[aria-current="page"],[aria-current="true"]'));
     if(current.length!==1)return null;
-    for(const row of rows.slice(rows.indexOf(current[0])+1)){
+    for(const row of (settings.catalogFromTop?rows.filter(row=>row!==current[0]):rows.slice(rows.indexOf(current[0])+1))){
       const labels=[row,...row.querySelectorAll('[aria-label],[title]')].map(el=>(el.getAttribute('aria-label')||'')+' '+(el.getAttribute('title')||''));
       const done=row.classList.contains('ans-job-finished')||labels.some(t=>/^(?:任务点)?已完成$/.test(t.trim()));
       if(done)continue;
@@ -862,7 +888,8 @@
     const tasks=pageTaskState();
     const pageDone=tasks.total>0&&tasks.total===tasks.done;
     const plainTab=!records.length&&!tasks.total&&!questions.length&&plainTextTabReady();
-    if (questions.length&&!chapterDone&&!pageDone) { navigation = null; command(null, false, settings); return; }
+    const videoPending=records.some(r=>!r.done);
+    if (questions.some(q=>q.kind!=='practice'||!videoPending)&&!chapterDone&&!pageDone) { navigation = null; command(null, false, settings); return; }
     if (navigationLock) { command(null, false, settings); return; }
     const current = records.find(r => r.id === active);
     if (current?.done) { log(`任务点已完成：${current.title}`); active = null; }
@@ -1102,7 +1129,7 @@
     } else if (tab === '设置') {
       add('h2', '视频设置');
       const save = () => { GM_setValue('settings', settings); navigation = null; command(active, running && !!active, settings); };
-      for (const [key, title] of [['autoStart','打开学习页面自动开始'],['muted','静音播放'],['resume','持续检测暂停并恢复播放'],['next','任务点完成后自动进入下一节'],['autoAnswer','视频弹题自动搜题并填答'],['autoSubmit','填答后自动提交答案']]) {
+      for (const [key, title] of [['autoStart','打开学习页面自动开始'],['muted','静音播放'],['resume','持续检测暂停并恢复播放'],['next','任务点完成后自动进入下一节'],['catalogFromTop','按目录从上到下查找未完成任务（关闭后只向后查找）'],['autoAnswer','视频弹题自动搜题并填答'],['autoSubmit','填答后自动提交答案']]) {
         const label = add('label', ''); const input = document.createElement('input'); input.type = 'checkbox'; input.checked = settings[key]; label.append(input, title);
         input.onchange = () => { settings[key] = input.checked; save(); };
       }
@@ -1439,3 +1466,4 @@
     }
   }, 1000);
 })();
+
